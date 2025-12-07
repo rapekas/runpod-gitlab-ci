@@ -1,0 +1,542 @@
+variables:
+  # Docs
+  README: "<a href=https://github.com/rapekas/runpod-gitlab-ci>♿ README</a>"
+
+  ISSUE: "Runpod-1"
+
+  # Defaults
+  RUNPOD_INTERRUPTIBLE: "false" # https://docs.runpod.io/api-reference/pods/POST/pods#body-interruptible
+  RUNPOD_CLOUD_TYPE: "SECURE" # https://docs.runpod.io/pods/overview#pod-types
+  RUNPOD_GLOBAL_NET: "true"
+  HG_LLM: "google/gemma-3-4b-it" # LLM model, you warned about gated models
+  LLM_CTX: "4096" # Context window
+  LLM_TXT: "San Francisco is a" # Test text
+  RUNPOD_GPU_COUNT: "1" # Number of GPUs, using as --tp at vLLM startup
+  RUNPOD_GPU_TYPE: "NVIDIA RTX A5000" # Runpod GPU ID, see https://docs.runpod.io/references/gpu-types#gpu-types and https://docs.runpod.io/api-reference/endpoints/POST/endpoints#body-gpu-type-ids
+  RUNPOD_DISK_GB: "8" # Container disk, read template prereqs, for ex. https://console.runpod.io/hub/template/gemma-3-27b-it-vllm-by-trelis?id=iiiurkp5pw
+  RUNPOD_VOLUME_GB: "40" # Permanent volume mounted to /workspace, destroyed at pod termination
+  RUNPOD_TEMPLATE: "iqilnw0ymf"
+#  RUNPOD_IMAGE: "vllm/vllm-openai:latest" # Choose between docker RUNPOD_IMAGE and presetted template RUNPOD_TEMPLATE,for info: RTX 5090s needs Pytorch 2.8+
+  GITLAB_DOCKER_IMAGE: "ubuntu:22.04" # 🦊 Docker image for your Gitlab Runner
+  RUNPOD_CUDA_VERSION: "12.8"
+  VLLM_BATCHED_TOKENS: "1024"
+  RUNPOD_NAME: "$ISSUE-$RUNPOD_TEMPLATE-$HG_LLM-$RUNPOD_GPU_TYPE" # Pod name - hint: issue number and phase
+  RUNPOD_API_BASE_URL: "https://rest.runpod.io"
+
+
+# These variables must be set in Runpod
+# HUGGING_FACE_HUB_TOKEN - in the case when you refer to LLM models of the Gated type
+
+# These variables must be set in GitLab CI/CD Settings:
+# RUNPOD_API_KEY - Graphql API key with full rights
+# HG_TOKEN - authorization token,
+# created by your account in the profile https://huggingface.co/settings/tokens
+# - this access is not always required, but only for gated repositories,
+# which you have accessed in the browser,
+# the list is stored in https://huggingface.co/settings/gated-repos
+# RUNPOD_SSH_PRIVATE_KEY - private key for Gitab Runner access to the Runpod pod
+# (it is enough to store the key value, the file itself is not needed)
+# RUNPOD_SSH_PUBLIC_KEYS - public keys of Haulmont users,
+# who will automatically access the pod from their PCs.
+# Keys are written in one line separated by a separator \n
+
+
+stages:
+  - deploy
+  # Wait for the Pod to be ready. After creating the Pod, it may take time to switch to the RUNNING status and get an IP address.
+  - listing
+  # Get the IP address of the Pod. Using the RunPod API, you can get the status of a Pod and its public IP.
+  # Connect via SSH. Use the SSH key passed in the RUNPOD_SSH_PRIVATE_KEY variable and the IP address to connect to the Pod.
+  - stop
+  - start
+  - destroy
+
+
+image: $GITLAB_DOCKER_IMAGE
+
+
+# Auxiliary function for logging
+.log_user_time: &log_user_time |
+  echo "=== Started by: ⚡$GITLAB_USER_NAME at $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+
+# Auxiliary function for checking variables
+.check_vars: &check_vars |
+  if [ -z "$RUNPOD_API_KEY" ] || [ -z "$HG_TOKEN" ] || [ -z "$RUNPOD_SSH_PUBLIC_KEYS" ]; then
+    echo "Error: RUNPOD_API_KEY or HG_TOKEN, or RUNPOD_SSH_PUBLIC_KEYS are not set in GitLab CI/CD variables https://git.tz.haulmont.com/thesis/devops/ci-cd/gpu/runpod/-/settings/ci_cd#js-cicd-variables-settings"
+    exit 1
+  fi
+
+# Installing jq, curl, openssh-client
+.install_jq: &install_jq |
+  if ! command -v jq &> /dev/null; then
+    echo "jq is not installed. Installing jq..."
+    apt update && apt install -y jq curl openssh-client
+  else
+    echo "jq is already installed."
+  fi
+
+# Auxiliary function for SSH configuration
+.setup_ssh: &setup_ssh |
+  echo "Setting up SSH..."
+  if [ -z "$RUNPOD_SSH_PRIVATE_KEY" ]; then
+    echo "Error: RUNPOD_SSH_PRIVATE_KEY is not set."
+    exit 1
+  fi
+  mkdir -p ~/.ssh
+  echo "$RUNPOD_SSH_PRIVATE_KEY" > ~/.ssh/id_runpod
+  chmod 600 ~/.ssh/id_runpod
+  cat > ~/.ssh/config << EOF
+  Host runpod-pod
+    HostName *
+    User root
+    IdentityFile ~/.ssh/id_runpod
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+  EOF
+  chmod 600 ~/.ssh/config
+  echo "SSH setup complete."
+
+
+before_script:
+  - *check_vars
+  - *install_jq
+
+
+deploy_pod:
+  stage: deploy
+  when: manual
+  tags:
+    - gpu
+    - runpod
+  # It is risky to fill dockerStartCmd at the debugging stage. If the container goes into a cyclic restart, 
+  # the public IP will appear for 2 seconds and reset.
+  # In addition, in order for environment variables to be inserted into the Kubernetes Pod, 
+  # you must explicitly call a shell, such as bash or sh, and pass the command as an argument to this shell.
+  # Stay with "dockerStartCmd": [], first.
+  # Use --data according:
+  # https://docs.runpod.io/api-reference/pods/POST/pods
+  # https://docs.runpod.io/api-reference/endpoints/POST/endpoints
+
+  script:
+    - *log_user_time
+    - |
+      echo "Deploying Pod..."
+      RESPONSE=$(curl -s --request POST \
+        --url $RUNPOD_API_BASE_URL/v1/pods \
+        --header "Authorization: Bearer $RUNPOD_API_KEY" \
+        --header "Content-Type: application/json" \
+        --data '{
+          "allowedCudaVersions": [
+            "'"$RUNPOD_CUDA_VERSION"'"
+          ],
+          "cloudType": "'"$RUNPOD_CLOUD_TYPE"'",
+          "computeType": "GPU",
+          "containerDiskInGb": '"$RUNPOD_DISK_GB"',
+          "cpuFlavorIds": [
+            "cpu3c"
+          ],
+          "cpuFlavorPriority": "availability",
+          "dataCenterPriority": "availability",
+          "dockerEntrypoint": [],
+          "dockerStartCmd": [
+            "'"$HG_LLM"'",
+            "--host", "0.0.0.0",
+            "--port", "8000",
+            "--tensor-parallel-size", "'"$RUNPOD_GPU_COUNT"'",
+            "--max-model-len", "'"$LLM_CTX"'",
+            "--enforce-eager",
+            "--enable-prefix-caching",
+            "--max-num-batched-tokens", "'"$VLLM_BATCHED_TOKENS"'"
+          ],
+          "env": {
+             "HF_TOKEN": "'"$HG_TOKEN"'"
+          },
+          "globalNetworking": '"$RUNPOD_GLOBAL_NET"',
+          "gpuCount": '"$RUNPOD_GPU_COUNT"',
+          "gpuTypeIds": [
+            "'"$RUNPOD_GPU_TYPE"'"
+          ],
+          "gpuTypePriority": "availability",
+          "imageName": "'"$RUNPOD_IMAGE"'",
+          "interruptible": '"$RUNPOD_INTERRUPTIBLE"',
+          "locked": false,
+          "minDiskBandwidthMBps": 123,
+          "minDownloadMbps": 123,
+          "minRAMPerGPU": 8,
+          "minUploadMbps": 123,
+          "minVCPUPerGPU": 2,
+          "name": "'"$RUNPOD_NAME"'",
+          "ports": [
+            "8000/http",
+            "22/tcp"
+          ],
+          "supportPublicIp": true,
+          "templateId": "'"$RUNPOD_TEMPLATE"'",
+          "vcpuCount": 2,
+          "volumeInGb": '"$RUNPOD_VOLUME_GB"',
+          "volumeMountPath": "/workspace"
+        }')
+      echo "Deployment response: $RESPONSE"
+      POD_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+      if [ "$POD_ID" = "null" ] || [ -z "$POD_ID" ]; then
+          echo "Error: Failed to get Pod ID from response. ID is null or empty."
+          echo "Full response: $RESPONSE"
+          exit 1
+      fi
+
+      echo "+++++++++++++++++++++++++++++++"
+      GPU_CMD=$(echo "$RESPONSE" | jq -r '.dockerStartCmd // empty')
+      GPU_POD_NAME=$(echo "$RESPONSE" | jq -r '.name // empty')
+      GPU_LOCATION=$(echo "$RESPONSE" | jq -r '.machine."location" // empty')
+      GPU_DC=$(echo "$RESPONSE" | jq -r '.machine."dataCenterId" // empty')
+      GPU_COST=$(echo "$RESPONSE" | jq -r '.costPerHr // empty')
+      GPU_TYPE=$(echo "$RESPONSE" | jq -r '.machine."gpuTypeId" // empty')
+      GPU_COUNT=$(echo "$RESPONSE" | jq -r '.gpuCount // empty')
+      GPU_POD_DOCKER_IMAGE=$(echo "$RESPONSE" | jq -r '.imageName // empty')
+      GPU_POD_RAM=$(echo "$RESPONSE" | jq -r '.memoryInGb // empty')
+      GPU_POD_VCPU=$(echo "$RESPONSE" | jq -r '.vcpuCount // empty')
+      GPU_WORK_VOL_GB=$(echo "$RESPONSE" | jq -r '.volumeInGb // empty')
+      GPU_WORK_MOUNT=$(echo "$RESPONSE" | jq -r '.volumeMountPath // empty')
+      GPU_POD_DISK_THR=$(echo "$RESPONSE" | jq -r '.machine."diskThroughputMBps" // empty')
+      GPU_NET_DOWN=$(echo "$RESPONSE" | jq -r '.machine."maxDownloadSpeedMbps" // empty')
+      GPU_NET_UP=$(echo "$RESPONSE" | jq -r '.machine."maxUploadSpeedMbps" // empty')
+      GPU_CONTAINER_GB=$(echo "$RESPONSE" | jq -r '.containerDiskInGb // empty')
+      GPU_TEMPLATE=$(echo "$RESPONSE" | jq -r '.templateId // empty')
+      GPU_POD_CREATED=$(echo "$RESPONSE" | jq -r '.createdAt // empty')
+      GPU_POD_LAST_STARTED=$(echo "$RESPONSE" | jq -r '.lastStartedAt // empty')
+      
+      echo "CMD:             $GPU_CMD"
+      echo "-------------------------------"
+      echo "INTERRUPTABLE:   ⛔$RUNPOD_INTERRUPTIBLE"
+      echo "LAST STARTED:    $GPU_POD_LAST_STARTED"
+      echo "CREATED:         $GPU_POD_CREATED"
+      echo "TEMPLATE:        $GPU_TEMPLATE at https://console.runpod.io/hub?tabSelected=templates"
+      echo "POD NAME:        $GPU_POD_NAME"
+      echo "LOCATION:        $GPU_LOCATION"
+      echo "DC:              $GPU_DC"
+      echo "COST:            💲$GPU_COST"
+      echo "GPU TYPE:        $GPU_COUNTx$GPU_TYPE"
+      echo "DOCKER IMAGE:    $GPU_POD_DOCKER_IMAGE"
+      echo "LLM MODEL:       $HG_LLM"
+      echo "POD RAM:         $GPU_POD_RAM"
+      echo "POD vCPU:        $GPU_POD_VCPU"
+      echo "DISK MBps:       ⭕$GPU_POD_DISK_THR"
+      echo "NET DOWN Mbps:   ⏬$GPU_NET_DOWN"
+      echo "NET UPLOAD Mbps: ⏫$GPU_NET_UP"
+      echo "CONTAINER GB:    $GPU_CONTAINER_GB"
+      echo "WORK VOL GB:     $GPU_WORK_VOL_GB"
+      echo "WORK MOUNT:      $GPU_WORK_MOUNT"
+
+      echo "+++++++++++++++++++++++++++++++"
+      echo "Pod ID created: $POD_ID"
+      echo "-------------------------------"
+      echo " ☐"
+      echo " ☐ BY CONTINUING TO USE THIS TOOL,"
+      echo " ☐ YOU AGREE TO THE TERMS BELOW."
+      echo " ☐"
+      echo " ☐ Open the link of the created Pod in the browser: "
+      echo " https://console.runpod.io/pods?id=$POD_ID"
+      echo " ☐"
+      echo " ☑ YES, I realized that now I need to click on the link above"
+      echo " and go to the Logs tab to monitor the status of the hearth."
+      echo " The container is deployed first (System button) "
+      echo " Then the LLM model is loaded (Container button)."
+      echo " When the container is finished deploying, I will see the icon"
+      echo " READY🟢" at the Connect tab and the HTTP Service link (not https!)"
+      echo " Then I can use this URL as the vLLM Endpoint."
+      echo " ☐"
+      echo " ☑ YES, I realized that the vLLM API URL is unavailable for me at this stage."
+      echo " To find out, I have to wait for the end of deployment"
+      echo " and then run the list_all_pods pipeline stage"
+      echo " ☐"
+      echo " ☑ YES, I understood that in case of problems, I do these steps:"
+      echo " ☑ READ THE DOCUMENTATION: $README"
+      echo " ☐"
+      echo " 1. ◍.... GO to the "Logs" tab and wait until the Container button appears."
+      echo " 2....... Use SSH data on the "Connect" tab <---- ONLY after the HTTP service is READY🟢:"
+      echo " 3...◍.. View the available routes in the log, then run _curl_ from the command line:"
+      echo " curl -s https://$POD_ID-8000.proxy.runpod.net/v1/models | jq ."
+      echo " or, if there is a color in the output (a dot at the end is required):"
+      echo "    curl -s -D /dev/null https://$POD_ID-8000.proxy.runpod.net/v1/models | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | jq ."
+      echo " 4....◍. Use Stop Pod at your own risk, as Pod may not resume due to GPU loss (even when uninterruptable)."
+      echo " 5.....◍ DESTROY POD IF IT IS NOT IN USE => STOP + TERMINATE."
+      echo "+++++++++++++++++++++++++++++++"
+
+      echo "$POD_ID" > podid.txt
+      # Saving the Pod ID to a variable for use in other steps
+      echo "export POD_ID=$POD_ID" > pod_env.sh
+    - *log_user_time
+  artifacts:
+    paths:
+      - podid.txt
+      - pod_env.sh
+    expire_in: 8 hour
+
+
+list_all_pods:
+  stage: listing
+  when: manual
+  tags:
+    - gpu
+    - runpod
+  script:
+    - *log_user_time
+    - |
+      echo "Listing all existing Pods..."
+      RESPONSE=$(curl -s --request GET \
+        --url $RUNPOD_API_BASE_URL/v1/pods \
+        --header "Authorization: Bearer $RUNPOD_API_KEY")
+      echo "$RESPONSE"
+      
+      if echo "$RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1; then
+        echo "$RESPONSE" | jq -c '.[]' | while read -r pod_json; do
+          POD_ID=$(echo "$pod_json" | jq -r '.id // empty')
+          PUBLIC_IP=$(echo "$pod_json" | jq -r '.publicIp // empty')
+          SSH_PORT=$(echo "$pod_json" | jq -r '.portMappings."22" // empty')
+          COST=$(echo "$pod_json" | jq -r '.costPerHr // empty')
+          STATUS=$(echo "$pod_json" | jq -r '.desiredStatus // empty')
+          IMAGE=$(echo "$pod_json" | jq -r '.imageName // empty')
+          TEMPLATE=$(echo "$pod_json" | jq -r '.templateId // empty')
+          LAST_STARTED=$(echo "$pod_json" | jq -r '.lastStartedAt // empty')
+          LAST_STATUS=$(echo "$pod_json" | jq -r '.lastStatusChange // empty')
+          
+          if [ -n "$POD_ID" ]; then
+            echo "PodID=$POD_ID"
+            echo "$POD_ID" > podid.txt
+            echo "INFO: Pod ID saved to podid.txt (overwritten!)"
+
+            # Check variable DEPLOY_COMPLETED_$POD_ID exists - needs bcz deploy ans listing stages may be executed any time
+            EXISTS=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+              --url "${GITLAB_API_BASE_URL}/projects/$CI_PROJECT_ID/variables/DEPLOY_COMPLETED_$POD_ID" \
+              --write-out "%{http_code}" \
+              --output /dev/null)
+            if [ "$EXISTS" != "200" ]; then
+              echo "The DEPLOY_COMPLETED_$POD_ID flag was not found. Performing initialization..."
+              # Creating DISCOURSE_THREAD_$POD_ID if there is none
+              THREAD_ID_VAR_EXISTS=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                --url "${GITLAB_API_BASE_URL}/projects/$CI_PROJECT_ID/variables/DISCOURSE_THREAD_$POD_ID" \
+                --write-out "%{http_code}" \
+                --output /dev/null)
+              if [ "$THREAD_ID_VAR_EXISTS" != "200" ]; then
+                THREAD_ID="${POD_ID}@${GITLAB_HOST}"
+                echo "Creating DISCOURSE_THREAD_$POD_ID: $THREAD_ID"
+            fi
+      
+            # Get the THREAD_ID from the project variable (it is dynamic and unavailable after it appears in another stage)
+            THREAD_ID_RESPONSE=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+              --url "${GITLAB_API_BASE_URL}/projects/$CI_PROJECT_ID/variables/DISCOURSE_THREAD_$POD_ID")
+            THREAD_ID=$(echo "$THREAD_ID_RESPONSE" | jq -r .value)
+            if [ -n "$THREAD_ID" ]; then
+              echo "THREAD_ID: $THREAD_ID"
+            else
+              echo "Error: THREAD_ID not found or empty."
+              exit 1
+            fi
+          fi
+            if [ -n "$PUBLIC_IP" ]; then
+              echo "INFO: IP saved to publicip.txt"
+              echo "+++++++++++++++++++++++++++++++"
+              echo "RUNPOD_PUBLIC_IP=$PUBLIC_IP"
+              echo "$PUBLIC_IP" > publicip.txt
+            else
+              echo "WARN: publicIp: (not assigned or not available in response)"
+            fi
+            if [ -n "$SSH_PORT" ]; then
+              echo "RUNPOD_SSH_PORT=$SSH_PORT"
+              echo "+++++++++++++++++++++++++++++++"
+              echo "$SSH_PORT" > sshport.txt
+              echo "INFO: SSH Port saved to sshport.txt"
+              echo " ☐"
+              echo "Testing LLM endpoint on Pod $POD_ID... (sometimes it may not work)"
+              curl -s \
+                -X POST "https://$POD_ID-8000.proxy.runpod.net/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "model": "'"$HG_LLM"'",
+                  "messages": [
+                    { "role": "user", "content": "'"$LLM_TXT"'" }
+                  ],
+                  "max_tokens": 250,
+                  "temperature": 0
+                }' \
+                | jq -r . \
+                | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'
+             else
+               echo "WARN: RUNPOD_SSH_PORT: (not mapped or not available in response)"
+             fi
+          fi
+        done
+      else
+        echo "WARN: Response is not a JSON array. Cannot parse pods."
+      fi
+      if [ -f podid.txt ]; then
+        POD_ID_FROM_FILE=$(cat podid.txt)
+        if [ "$POD_ID_FROM_FILE" = "null" ] || [ -z "$POD_ID_FROM_FILE" ]; then
+          echo "WARN: Pod ID in podid.txt is invalid (null or empty): $POD_ID_FROM_FILE, skipping output."
+        else
+          echo " ☐"
+          echo "POD_IP=$POD_ID_FROM_FILE" > pod_ip_dotenv.txt
+          echo "PodID (from file podid.txt): $POD_ID_FROM_FILE"
+          echo " ☐"
+          echo " ☐ Current LLM models loaded:"
+          LLM_LOADED=$(curl -s -D /dev/null https://$POD_ID_FROM_FILE-8000.proxy.runpod.net/v1/models | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | jq .)
+          echo "$LLM_LOADED"
+          echo " ☐"
+          echo " ☐ BY CONTINUING USING THIS TOOL,"
+          echo " ☐ YOU AGREE TO THE TERMS BELOW."
+          echo " ☐"
+          echo " ☐ Open the link of the created Pod in the browser: "
+          echo " https://console.runpod.io/pods?id=$POD_ID_FROM_FILE"
+          echo " ☐"
+          echo " ☑ YES, I realized that now I need to click on the link above"
+          echo " and go to the Logs tab to monitor the status of the Pod."
+          echo " The container is deployed first (System button) "
+          echo " Then the LLM model is loaded (Container button)."
+          echo " When the container is finished deploying, I will see the icon"
+          echo " READY🟢" at the Connect tab and the HTTP Service link (not https!)"
+          echo " Now I can use this URL as a vLLM Endpoint."
+          echo " ☐"
+          echo " $README"
+          echo " ☐"
+          echo " ☑ YES, I realized that the list of available vLLM API endpoints"
+          echo " Is displayed at the end of the Container log. In the same log, I can view"
+          echo " throughput and generation (tokens/s) and % of hits in the cache."
+          echo " ☐"
+        fi
+      else
+          echo "WARN: podid.txt file not found."
+          echo "+++++++++++++++++++++++++++++++"
+          echo "WARN: Probably no any Pods exist."
+          echo "NEXT: Check Pods manually here:"
+          echo "https://console.runpod.io/pods"
+          echo "+++++++++++++++++++++++++++++++"
+      fi
+    - *log_user_time
+  artifacts:
+    reports:
+      dotenv: pod_ip_dotenv.txt
+    paths:
+      - podid.txt
+      - publicip.txt
+      - sshport.txt
+      - pod_ip_dotenv.txt
+    expire_in: 8 hour
+
+
+destroy_pod:
+  stage: destroy
+  image: curlimages/curl:latest
+  when: manual
+  needs: # Requires successful execution of list_all_pods in the SAME pipeline run
+    - job: list_all_pods
+      artifacts: true # Get artifacts from list_all_pods (including podid.txt )
+  tags:
+    - gpu
+    - runpod
+  script:
+    - *log_user_time
+    - |
+      if [ -n "$RUNPOD_DESTROY_ID" ] && [ "$RUNPOD_DESTROY_ID" != "null" ] && [ "$RUNPOD_DESTROY_ID" != " " ]; then
+        echo "USER provided RUNPOD_DESTROY_ID. Using: $RUNPOD_DESTROY_ID"
+        POD_ID_TO_DESTROY="$RUNPOD_DESTROY_ID"
+      elif [ -f podid.txt ]; then
+        POD_ID_FROM_FILE=$(cat podid.txt)
+        if [ "$POD_ID_FROM_FILE" = "null" ] || [ -z "$POD_ID_FROM_FILE" ]; then
+             echo "ERROR: Pod ID in podid.txt is invalid (null or empty): $POD_ID_FROM_FILE"
+             exit 1
+        fi
+        echo "Using Pod ID from file: podid.txt ($POD_ID_FROM_FILE)"
+        POD_ID_TO_DESTROY="$POD_ID_FROM_FILE"
+      else
+        echo "ERROR: No valid Pod ID found in RUNPOD_DESTROY_ID variable or podid.txt file."
+        echo "+++++++++++++++++++++++++++++++"
+        echo "WARN: Probably no any Pods exist."
+        echo "NEXT: Check Pods manually here:"
+        echo "https://console.runpod.io/pods"
+        echo "+++++++++++++++++++++++++++++++"
+        exit 1
+      fi
+      echo "DESTROYING Pod with ID: $POD_ID_TO_DESTROY"
+      RESPONSE=$(curl -s --request DELETE \
+        --url $RUNPOD_API_BASE_URL/v1/pods/$POD_ID_TO_DESTROY \
+        --header "Authorization: Bearer $RUNPOD_API_KEY")
+      echo "Destroy response: $RESPONSE"
+      # Remove variable (DELETE)
+      curl --request DELETE --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        --url "${GITLAB_API_BASE_URL}/projects/$CI_PROJECT_ID/variables/DISCOURSE_THREAD_$POD_ID"
+    - *log_user_time
+
+
+stop_pod:
+  stage: stop
+  image: curlimages/curl:latest
+  when: manual
+  needs:
+    - job: list_all_pods
+      artifacts: true
+  tags:
+    - gpu
+    - runpod
+  script:
+    - *log_user_time
+    - |
+      if [ -f podid.txt ]; then
+        POD_ID_FROM_FILE=$(cat podid.txt)
+        if [ "$POD_ID_FROM_FILE" = "null" ] || [ -z "$POD_ID_FROM_FILE" ]; then
+             echo "ERROR: Pod ID in podid.txt is invalid (null or empty): $POD_ID_FROM_FILE"
+             exit 1
+        fi
+        echo "Using Pod ID from file: podid.txt ($POD_ID_FROM_FILE)"
+      else
+        echo "ERROR: No valid Pod ID found in POD_ID_FROM_FILE variable or podid.txt file."
+        echo "+++++++++++++++++++++++++++++++"
+        echo "WARN: Probably no any Pods exist."
+        echo "NEXT: Check Pods manually here:"
+        echo "https://console.runpod.io/pods"
+        echo "+++++++++++++++++++++++++++++++"
+        exit 1
+      fi
+      echo "STOPPING Pod with ID: $POD_ID_FROM_FILE"
+      RESPONSE=$(curl -s --request POST \
+        --url $RUNPOD_API_BASE_URL/v1/pods/$POD_ID_FROM_FILE/stop \
+        --header "Authorization: Bearer $RUNPOD_API_KEY")
+      echo "Stop response: $RESPONSE"
+    - *log_user_time
+
+
+start_pod:
+  stage: start
+  image: curlimages/curl:latest
+  when: manual
+  needs:
+    - job: list_all_pods
+      artifacts: true
+  tags:
+    - gpu
+    - runpod
+  script:
+    - *log_user_time
+    - |
+      if [ -f podid.txt ]; then
+        POD_ID_FROM_FILE=$(cat podid.txt)
+        if [ "$POD_ID_FROM_FILE" = "null" ] || [ -z "$POD_ID_FROM_FILE" ]; then
+             echo "ERROR: Pod ID in podid.txt is invalid (null or empty): $POD_ID_FROM_FILE"
+             exit 1
+        fi
+        echo "Using Pod ID from file: podid.txt ($POD_ID_FROM_FILE)"
+      else
+        echo "ERROR: No valid Pod ID found in POD_ID_FROM_FILE variable or podid.txt file."
+        echo "+++++++++++++++++++++++++++++++"
+        echo "WARN: Probably no any Pods exist."
+        echo "NEXT: Check Pods manually here:"
+        echo "https://console.runpod.io/pods"
+        echo "+++++++++++++++++++++++++++++++"
+        exit 1
+      fi
+      echo "STARTING Pod with ID: $POD_ID_FROM_FILE"
+      RESPONSE=$(curl -s --request POST \
+        --url $RUNPOD_API_BASE_URL/v1/pods/$POD_ID_FROM_FILE/start \
+        --header "Authorization: Bearer $RUNPOD_API_KEY")
+      echo "Start response: $RESPONSE"
+    - *log_user_time
