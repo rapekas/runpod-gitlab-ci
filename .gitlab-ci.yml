@@ -243,7 +243,7 @@ deploy_pod:
       echo " The container is deployed first (System button) "
       echo " Then the LLM model is loaded (Container button)."
       echo " When the container is finished deploying, I will see the icon"
-      echo " READY🟢" at the Connect tab and the HTTP Service link (not https!)"
+      echo " READY🟢 at the Connect tab and the HTTP Service link (not https!)"
       echo " Then I can use this URL as the vLLM Endpoint."
       echo " ☐"
       echo " ☑ YES, I realized that the vLLM API URL is unavailable for me at this stage."
@@ -394,7 +394,7 @@ list_all_pods:
           echo " The container is deployed first (System button) "
           echo " Then the LLM model is loaded (Container button)."
           echo " When the container is finished deploying, I will see the icon"
-          echo " READY🟢" at the Connect tab and the HTTP Service link (not https!)"
+          echo " READY🟢 at the Connect tab and the HTTP Service link (not https!)"
           echo " Now I can use this URL as a vLLM Endpoint."
           echo " ☐"
           echo " $README"
@@ -463,8 +463,8 @@ destroy_pod:
         --header "Authorization: Bearer $RUNPOD_API_KEY")
       echo "Destroy response: $RESPONSE"
       # Remove variable (DELETE)
-      curl --request DELETE --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
-        --url "${GITLAB_API_BASE_URL}/projects/$CI_PROJECT_ID/variables/DISCOURSE_THREAD_$POD_ID"
+      #curl --request DELETE --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+      #  --url "${GITLAB_API_BASE_URL}/projects/$CI_PROJECT_ID/variables/DISCOURSE_THREAD_$POD_ID"
     - *log_user_time
 
 
